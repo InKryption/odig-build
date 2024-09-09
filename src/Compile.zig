@@ -13,6 +13,7 @@ target_features: ?usize = null,
 artifact: Build.LazyPath,
 depfile: Build.LazyPath,
 timings: ?Build.LazyPath = null,
+defineables: ?Build.LazyPath = null,
 
 pub fn getArtifact(compile: *const Compile) Build.LazyPath {
     return compile.artifact;
@@ -30,6 +31,13 @@ pub fn getTimings(compile: *Compile) Build.LazyPath {
     const timings = compile.run_step.addPrefixedOutputFileArg("-export-timings-file:", output_name);
     compile.timings = timings;
     return timings;
+}
+
+pub fn getDefineables(compile: *Compile) Build.LazyPath {
+    if (compile.defineables) |defineables| return defineables;
+    const defineables = compile.run_step.addPrefixedOutputFileArg("-export-defineables:", compile.owner.fmt("{s}.csv", .{compile.options.name}));
+    compile.defineables = defineables;
+    return defineables;
 }
 
 pub fn addDefine(compile: *const Compile, name: []const u8, value: []const u8) void {
@@ -103,6 +111,8 @@ pub const Options = struct {
 
         timings: ?TimingsLevel = null,
         export_timings: ?ExportTimings = null,
+
+        show_defineables: bool = false,
 
         thread_count: ?u64 = null,
         debug: bool = false,
