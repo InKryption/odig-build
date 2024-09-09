@@ -2,11 +2,14 @@ pub const build = @compileError("This build.zig is intended to be imported as a 
 
 pub const OdinExe = @import("src/OdinExe.zig");
 
+pub const Optimize = @import("src/optimize.zig").Optimize;
+pub const timings = @import("src/timings.zig");
+pub const ErrorPosStyle = @import("src/error_pos_style.zig").ErrorPosStyle;
+pub const Sanitize = @import("src/sanitize.zig").Sanitize;
+
 pub const Src = @import("src/Src.zig");
 
 pub const Compile = @import("src/Compile.zig");
-
-pub const Optimize = Compile.Optimize;
 
 pub const addArtifact = Compile.addArtifact;
 pub const addRunArtifact = Compile.addRunArtifact;
