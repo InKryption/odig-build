@@ -5,12 +5,14 @@ run_step: *Build.Step.Run,
 
 build_mode: BuildMode,
 options: Options,
+
 extra_linker_flags: ?usize = null,
 extra_assembler_flags: ?usize = null,
 target_features: ?usize = null,
 
 artifact: Build.LazyPath,
 depfile: Build.LazyPath,
+timings: ?Build.LazyPath = null,
 
 pub fn getArtifact(compile: *const Compile) Build.LazyPath {
     return compile.artifact;
@@ -18,6 +20,16 @@ pub fn getArtifact(compile: *const Compile) Build.LazyPath {
 
 pub fn getDepFile(compile: *const Compile) Build.LazyPath {
     return compile.depfile;
+}
+
+pub fn getTimings(compile: *Compile) Build.LazyPath {
+    if (compile.timings) |timings| return timings;
+    const maybe_ext = if (compile.options.params.export_timings) |timings_fmt| timings_fmt.asString() else null;
+    const basename = compile.options.name;
+    const output_name = if (maybe_ext) |ext| compile.owner.fmt("{s}.{s}", .{ basename, ext }) else basename;
+    const timings = compile.run_step.addPrefixedOutputFileArg("-export-timings-file:", output_name);
+    compile.timings = timings;
+    return timings;
 }
 
 pub fn addDefine(compile: *const Compile, name: []const u8, value: []const u8) void {
@@ -87,6 +99,11 @@ pub const Options = struct {
     }
 
     pub const Params = struct {
+        show_system_calls: bool = false,
+
+        timings: ?TimingsLevel = null,
+        export_timings: ?ExportTimings = null,
+
         thread_count: ?u64 = null,
         debug: bool = false,
         disable_assert: bool = false,
@@ -142,9 +159,15 @@ pub const Options = struct {
             inline for (@typeInfo(Compile.Options.Params).@"struct".fields) |field| {
                 const field_ptr = &@field(result, field.name);
                 switch (field.type) {
-                    bool => {},
-                    ?[]const u8 => field_ptr.* = if (field_ptr.*) |str| b.dupe(str) else null,
-                    ?u64 => {},
+                    bool,
+                    ?TimingsLevel,
+                    ?u64,
+                    => {},
+
+                    ?[]const u8,
+                    => field_ptr.* = if (field_ptr.*) |str| b.dupe(str) else null,
+
+                    ?ExportTimings,
                     ?RelocMode,
                     ?ErrorPosStyle,
                     ?Sanitize,
@@ -156,25 +179,31 @@ pub const Options = struct {
             return result;
         }
 
-        pub fn addToArgs(params: Params, b: *Build, compile_run_step: *Build.Step.Run) void {
-            inline for (@typeInfo(Compile.Options.Params).@"struct".fields) |field| {
+        pub fn addUnconditionalToArgs(params: Params, b: *Build, compile_run_step: *Build.Step.Run) void {
+            inline for (@typeInfo(Params).@"struct".fields) |field| {
+                const kebab_name = comptime comptimeReplaceScalar(u8, field.name, '_', '-');
                 const field_value = @field(params, field.name);
                 switch (field.type) {
                     bool => if (field_value) {
-                        compile_run_step.addArg("-" ++ snakeToKebabCase(field.name));
+                        compile_run_step.addArg("-" ++ kebab_name);
                     },
                     ?[]const u8 => if (field_value) |str| {
-                        compile_run_step.addArg(b.fmt("-" ++ snakeToKebabCase(field.name) ++ ":{s}", .{str}));
+                        compile_run_step.addArg(b.fmt("-" ++ kebab_name ++ ":{s}", .{str}));
                     },
                     ?u64 => if (field_value) |int| {
-                        compile_run_step.addArg(b.fmt("-" ++ snakeToKebabCase(field.name) ++ ":{d}", .{int}));
+                        compile_run_step.addArg(b.fmt("-" ++ kebab_name ++ ":{d}", .{int}));
                     },
                     ?Optimize,
+                    ?ExportTimings,
                     ?RelocMode,
                     ?ErrorPosStyle,
                     ?Sanitize,
                     => if (field_value) |tag| {
-                        compile_run_step.addArg(b.fmt("-" ++ snakeToKebabCase(field.name) ++ ":{d}", .{tag.asString()}));
+                        compile_run_step.addArg(b.fmt("-" ++ kebab_name ++ ":{s}", .{tag.asString()}));
+                    },
+                    ?TimingsLevel,
+                    => if (field_value) |timings_level| {
+                        compile_run_step.addArg(timings_level.asParamString());
                     },
 
                     else => |T| @compileError("Unhandled " ++ @typeName(T)),
@@ -195,26 +224,15 @@ pub const Optimize = union(enum) {
     other: []const u8,
 
     pub fn fromStringOpt(maybe_str: ?[]const u8) ?Optimize {
-        const str = maybe_str orelse return null;
-        return fromString(str);
+        return fromString(maybe_str orelse return null);
     }
 
     pub fn fromString(str: []const u8) Optimize {
-        const tag = std.meta.stringToEnum(@typeInfo(Optimize).@"union".tag_type.?, str) orelse .other;
-        return switch (tag) {
-            .other => .{ .other = str },
-            inline else => |itag| @unionInit(Optimize, @tagName(itag), {}),
-        };
+        return parseEnumUnionWithOtherField(Optimize, .other, str);
     }
 
-    pub fn asString(optimize: Optimize) []const u8 {
-        return switch (optimize) {
-            .other => |other| other,
-            inline else => |void_value, tag| comptime blk: {
-                std.debug.assert(void_value == {});
-                break :blk snakeToKebabCase(@tagName(tag));
-            },
-        };
+    pub fn asString(sanitize: Optimize) []const u8 {
+        return enumUnionWithOtherFieldAsString(Optimize, .other, sanitize);
     }
 
     pub fn dupe(optimize: Optimize, b: *Build) Optimize {
@@ -236,14 +254,16 @@ pub const BuildMode = union(enum) {
     /// Other untyped but valid build mode.
     other: []const u8,
 
-    pub fn asString(build_mode: BuildMode) []const u8 {
-        return switch (build_mode) {
-            .other => |other| other,
-            inline else => |void_value, tag| comptime blk: {
-                std.debug.assert(void_value == {});
-                break :blk snakeToKebabCase(@tagName(tag));
-            },
-        };
+    pub fn fromStringOpt(maybe_str: ?[]const u8) ?BuildMode {
+        return fromString(maybe_str orelse return null);
+    }
+
+    pub fn fromString(str: []const u8) BuildMode {
+        return parseEnumUnionWithOtherField(BuildMode, .other, str);
+    }
+
+    pub fn asString(sanitize: BuildMode) []const u8 {
+        return enumUnionWithOtherFieldAsString(BuildMode, .other, sanitize);
     }
 
     pub fn dupe(build_mode: BuildMode, b: *Build) BuildMode {
@@ -254,23 +274,70 @@ pub const BuildMode = union(enum) {
     }
 };
 
+pub const ExportTimings = union(enum) {
+    json,
+    csv,
+
+    /// Other untyped but valid timings format.
+    other: []const u8,
+
+    pub fn fromStringOpt(maybe_str: ?[]const u8) ?ExportTimings {
+        return fromString(maybe_str orelse return null);
+    }
+
+    pub fn fromString(str: []const u8) ExportTimings {
+        return parseEnumUnionWithOtherField(ExportTimings, .other, str);
+    }
+
+    pub fn asString(sanitize: ExportTimings) []const u8 {
+        return enumUnionWithOtherFieldAsString(ExportTimings, .other, sanitize);
+    }
+
+    pub fn dupe(timings_fmt: ExportTimings, b: *Build) ExportTimings {
+        return switch (timings_fmt) {
+            .other => |other| .{ .other = b.dupe(other) },
+            inline else => |_, tag| comptime @unionInit(ExportTimings, @tagName(tag), {}),
+        };
+    }
+};
+
+pub const TimingsLevel = enum {
+    show,
+    @"show-more",
+
+    pub const show_more: TimingsLevel = .@"show-more";
+
+    pub const FromStringError = error{InvalidValue};
+
+    pub fn asParamString(kind: TimingsLevel) []const u8 {
+        return switch (kind) {
+            .show => "-show-timings",
+            .@"show-more" => "-show-more-timings",
+        };
+    }
+};
+
 pub const RelocMode = union(enum) {
     default,
     static,
     pic,
-    dynamic_no_pic,
+    @"dynamic-no-pic",
 
     /// Other untyped but valid reloc mode.
     other: []const u8,
 
-    pub fn asString(reloc_mode: RelocMode) []const u8 {
-        return switch (reloc_mode) {
-            .other => |other| other,
-            inline else => |void_value, tag| comptime blk: {
-                std.debug.assert(void_value == {});
-                break :blk snakeToKebabCase(@tagName(tag));
-            },
-        };
+    pub const dynamic_no_pic: RelocMode = .@"dynamic-no-pic";
+
+    pub fn fromStringOpt(maybe_str: ?[]const u8) ?RelocMode {
+        return fromString(maybe_str orelse return null);
+    }
+
+    pub fn fromString(str: []const u8) RelocMode {
+        return parseEnumUnionWithOtherField(RelocMode, .other, str);
+    }
+
+    pub fn asString(sanitize: RelocMode) []const u8 {
+        return enumUnionWithOtherFieldAsString(RelocMode, .other, sanitize);
     }
 
     pub fn dupe(reloc_mode: RelocMode, b: *Build) RelocMode {
@@ -289,14 +356,16 @@ pub const ErrorPosStyle = union(enum) {
     /// Other untyped but valid error pos style.
     other: []const u8,
 
-    pub fn asString(error_pos_style: ErrorPosStyle) []const u8 {
-        return switch (error_pos_style) {
-            .other => |other| other,
-            inline else => |void_value, tag| comptime blk: {
-                std.debug.assert(void_value == {});
-                break :blk snakeToKebabCase(@tagName(tag));
-            },
-        };
+    pub fn fromStringOpt(maybe_str: ?[]const u8) ?ErrorPosStyle {
+        return fromString(maybe_str orelse return null);
+    }
+
+    pub fn fromString(str: []const u8) ErrorPosStyle {
+        return parseEnumUnionWithOtherField(ErrorPosStyle, .other, str);
+    }
+
+    pub fn asString(sanitize: ErrorPosStyle) []const u8 {
+        return enumUnionWithOtherFieldAsString(ErrorPosStyle, .other, sanitize);
     }
 
     pub fn dupe(error_pos_style: ErrorPosStyle, b: *Build) ErrorPosStyle {
@@ -315,14 +384,16 @@ pub const Sanitize = union(enum) {
     /// Other untyped but valid sanitization.
     other: []const u8,
 
+    pub fn fromStringOpt(maybe_str: ?[]const u8) ?Sanitize {
+        return fromString(maybe_str orelse return null);
+    }
+
+    pub fn fromString(str: []const u8) Sanitize {
+        return parseEnumUnionWithOtherField(Sanitize, .other, str);
+    }
+
     pub fn asString(sanitize: Sanitize) []const u8 {
-        return switch (sanitize) {
-            .other => |other| other,
-            inline else => |void_value, tag| comptime blk: {
-                std.debug.assert(void_value == {});
-                break :blk snakeToKebabCase(@tagName(tag));
-            },
-        };
+        return enumUnionWithOtherFieldAsString(Sanitize, .other, sanitize);
     }
 
     pub fn dupe(sanitize: Sanitize, b: *Build) Sanitize {
@@ -333,19 +404,10 @@ pub const Sanitize = union(enum) {
     }
 };
 
-pub inline fn snakeToKebabCase(comptime str: []const u8) []const u8 {
-    comptime {
-        var result = str[0..].*;
-        std.mem.replaceScalar(u8, &result, '_', '-');
-        const copy = result;
-        return &copy;
-    }
-}
-
 pub fn addArtifact(
     b: *Build,
-    build_mode: Compile.BuildMode,
-    options: Compile.Options,
+    build_mode: BuildMode,
+    options: Options,
 ) *Compile {
     const exe_display = options.odin.lp.getDisplayName();
     const compile_run_step = Build.Step.Run.create(b, b.fmt("odin({s}) build {s} {s} -out:{s}", .{
@@ -374,7 +436,7 @@ pub fn addArtifact(
     if (options.optimize) |optimize| compile_run_step.addArg(b.fmt("-o:{s}", .{optimize.asString()}));
     if (options.target) |target| compile_run_step.addArg(b.fmt("-target:{s}", .{target}));
 
-    options.params.addToArgs(b, compile_run_step);
+    options.params.addUnconditionalToArgs(b, compile_run_step);
 
     const compile = b.graph.arena.create(Compile) catch @panic("OOM");
     compile.* = .{
@@ -420,6 +482,63 @@ pub fn addInstallArtifactWithDir(
         install_dir,
         maybe_des_rel_path orelse compile.options.name,
     );
+}
+
+inline fn parseEnumUnionWithOtherField(
+    comptime U: type,
+    comptime other_tag: @typeInfo(U).@"union".tag_type.?,
+    str: []const u8,
+) U {
+    const tag = std.meta.stringToEnum(@typeInfo(U).@"union".tag_type.?, str) orelse other_tag;
+    return switch (tag) {
+        other_tag => @unionInit(U, @tagName(other_tag), str),
+        inline else => |itag| @unionInit(U, @tagName(itag), {}),
+    };
+}
+
+inline fn enumUnionWithOtherFieldAsString(
+    comptime U: type,
+    comptime other_tag: @typeInfo(U).@"union".tag_type.?,
+    value: U,
+) []const u8 {
+    return switch (value) {
+        other_tag => |other| other,
+        inline else => |void_value, tag| comptime blk: {
+            std.debug.assert(void_value == {});
+            break :blk @tagName(tag);
+        },
+    };
+}
+
+inline fn comptimeEql(
+    comptime T: type,
+    comptime a: []const T,
+    comptime b: []const T,
+) bool {
+    comptime {
+        if (a.len != b.len) return false;
+        const Vec = @Vector(a.len, T);
+        const a_vec: Vec = a[0..].*;
+        const b_vec: Vec = b[0..].*;
+        return @reduce(.And, a_vec == b_vec);
+    }
+}
+
+inline fn comptimeReplaceScalar(
+    comptime T: type,
+    comptime haystack: []const T,
+    comptime match: T,
+    comptime replacement: T,
+) []const T {
+    comptime {
+        if (haystack.len == 0) return haystack;
+        const Vec = @Vector(haystack.len, T);
+        const vec: Vec = haystack[0..].*;
+        const match_splat: Vec = @splat(match);
+        const replace_splat: Vec = @splat(replacement);
+        const replaced: [haystack.len]u8 = @select(T, vec == match_splat, replace_splat, vec);
+        return &replaced;
+    }
 }
 
 const std = @import("std");
